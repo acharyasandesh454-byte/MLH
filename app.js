@@ -1,18 +1,19 @@
-// ==================== APP STATE & MOCK DATA ====================
+// ==================== APP STATE & DATA ====================
 let currentToken = "";
-let validTokens = []; // Buffer array to keep tokens valid for 90s (prevents expiration while student fills form)
-const TOKEN_LIFESPAN_MS = 90000; // 90 seconds grace period
+let validTokens = [];
+const TOKEN_LIFESPAN_MS = 90000;
 
 let timerInterval = null;
 let currentTimerSeconds = 15;
-const REFRESH_INTERVAL = 15; // Seconds between QR code refreshes
+const REFRESH_INTERVAL = 15;
 let isSessionActive = true;
 let customTotalCapacity = null;
 
-// Setup Cross-Tab Communication Channel
-const attendanceChannel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("attend_qr_channel") : null;
+// PeerJS Real-Time Connection Setup
+let peer = null;
+let hostPeerId = null;
 
-// Pre-populated Student Roster
+// Roster Data
 let rosterData = [
   { id: "STU-101", name: "Alex Morgan", status: "present", time: "09:01 AM", device: "iPhone 14 (Safari)" },
   { id: "STU-102", name: "Liam Johnson", status: "present", time: "09:02 AM", device: "Pixel 7 (Chrome)" },
@@ -43,122 +44,78 @@ let rosterData = [
 
 let activeFilter = 'all';
 
-// Load stored roster if returning to session
-if (localStorage.getItem('attendqr_roster')) {
-  try {
-    rosterData = JSON.parse(localStorage.getItem('attendqr_roster'));
-  } catch (e) {
-    console.error("Could not parse saved roster:", e);
-  }
-}
-
-// Save initial/updated roster state
-function saveRosterState() {
-  localStorage.setItem('attendqr_roster', JSON.stringify(rosterData));
-}
-
-// ==================== INITIALIZATION & LISTENERS ====================
+// ==================== INITIALIZATION ====================
 document.addEventListener("DOMContentLoaded", () => {
   if (window.lucide) lucide.createIcons();
-  
-  generateNewToken();
-  startTokenTimer();
-  renderRoster();
-  updateMetrics();
 
-  // Listen for broadcasted student check-ins from other tabs
-  if (attendanceChannel) {
-    attendanceChannel.onmessage = (event) => {
-      if (event.data && event.data.type === "CHECK_IN") {
-        processCheckInRecord(event.data.payload);
-      }
-    };
-  }
-
-  // Fallback storage sync listener
-  window.addEventListener('storage', (e) => {
-    if (e.key === 'attendqr_roster' && e.newValue) {
-      rosterData = JSON.parse(e.newValue);
-      renderRoster();
-      updateMetrics();
-    }
-  });
-
-  // Auto-detect view from scanned URL parameters
   const urlParams = new URLSearchParams(window.location.search);
   const scannedToken = urlParams.get('token');
+  const scannedHostId = urlParams.get('host');
   const viewMode = urlParams.get('view');
 
   if (viewMode === 'student' || scannedToken) {
     switchView('student');
-    if (scannedToken) {
-      const tokenInput = document.getElementById('session-token');
-      if (tokenInput) tokenInput.value = scannedToken;
-    }
+    if (scannedToken) document.getElementById('session-token').value = scannedToken;
+    if (scannedHostId) window.scannedHostId = scannedHostId;
+  } else {
+    // Initialize Host Real-time Peer Connection
+    initHostPeer();
   }
+
+  renderRoster();
+  updateMetrics();
 });
 
-// ==================== VIEW SWITCHING ====================
-function switchView(viewName) {
-  document.querySelectorAll('.view-panel').forEach(panel => panel.classList.remove('active'));
-  document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
+// ==================== REAL-TIME WEBRTC (PEERJS) ====================
+function initHostPeer() {
+  peer = new Peer();
 
-  if (viewName === 'host') {
-    document.getElementById('host-view').classList.add('active');
-    document.getElementById('btn-host-view').classList.add('active');
-  } else {
-    document.getElementById('student-view').classList.add('active');
-    document.getElementById('btn-student-view').classList.add('active');
-    
-    const tokenInput = document.getElementById('session-token');
-    if (tokenInput && !tokenInput.value) {
-      tokenInput.value = currentToken;
-    }
-  }
+  peer.on('open', (id) => {
+    hostPeerId = id;
+    generateNewToken();
+    startTokenTimer();
+  });
+
+  // Listen for incoming student check-ins over the air
+  peer.on('connection', (conn) => {
+    conn.on('data', (data) => {
+      if (data && data.type === 'CHECK_IN') {
+        processCheckInRecord(data.payload);
+      }
+    });
+  });
+}
+
+function sendCheckInToHost(payload, hostId) {
+  if (!hostId) return;
+  const studentPeer = new Peer();
+  studentPeer.on('open', () => {
+    const conn = studentPeer.connect(hostId);
+    conn.on('open', () => {
+      conn.send({ type: 'CHECK_IN', payload });
+    });
+  });
 }
 
 // ==================== DYNAMIC QR & TOKEN MANAGEMENT ====================
 function generateNewToken() {
   currentToken = "TOK-" + Math.random().toString(36).substring(2, 9).toUpperCase();
-  
   const now = Date.now();
   validTokens.push({ token: currentToken, expiry: now + TOKEN_LIFESPAN_MS });
-  
-  // Clean up expired tokens older than 90 seconds
   validTokens = validTokens.filter(t => t.expiry > now);
 
-  // Sync latest valid tokens across local storage
-  localStorage.setItem('attendqr_valid_tokens', JSON.stringify(validTokens));
-
   renderQRCode(currentToken);
-  
-  const tokenInput = document.getElementById('session-token');
-  if (tokenInput) tokenInput.value = currentToken;
-}
-
-function validateToken(tokenToTest) {
-  const now = Date.now();
-  let tokens = validTokens;
-
-  // Pull tokens from storage in case student is on another tab
-  const storedTokens = localStorage.getItem('attendqr_valid_tokens');
-  if (storedTokens) {
-    try {
-      tokens = JSON.parse(storedTokens);
-    } catch(e) {}
-  }
-
-  return tokens.some(t => t.token === tokenToTest && t.expiry > now);
 }
 
 function renderQRCode(token) {
   const qrContainer = document.getElementById("qrcode");
   if (!qrContainer) return;
-  
   qrContainer.innerHTML = "";
 
   const baseURL = window.location.href.split('?')[0];
-  const checkinURL = `${baseURL}?view=student&token=${token}`;
+  // Attach hostPeerId so student devices can route check-ins back to host screen
+  const hostParam = hostPeerId ? `&host=${hostPeerId}` : '';
+  const checkinURL = `${baseURL}?view=student&token=${token}${hostParam}`;
 
   new QRCode(qrContainer, {
     text: checkinURL,
@@ -215,7 +172,48 @@ function toggleSessionState() {
   if (window.lucide) lucide.createIcons();
 }
 
+// ==================== VIEW SWITCHING ====================
+function switchView(viewName) {
+  document.querySelectorAll('.view-panel').forEach(panel => panel.classList.remove('active'));
+  document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
+
+  if (viewName === 'host') {
+    document.getElementById('host-view').classList.add('active');
+    document.getElementById('btn-host-view').classList.add('active');
+  } else {
+    document.getElementById('student-view').classList.add('active');
+    document.getElementById('btn-student-view').classList.add('active');
+    
+    const tokenInput = document.getElementById('session-token');
+    if (tokenInput && !tokenInput.value) {
+      tokenInput.value = currentToken;
+    }
+  }
+}
+
 // ==================== ROSTER & METRICS ====================
+function processCheckInRecord(record) {
+  let existingStudent = rosterData.find(s => s.id.toLowerCase() === record.id.toLowerCase());
+
+  if (existingStudent) {
+    existingStudent.name = record.name;
+    existingStudent.status = "present";
+    existingStudent.time = record.time;
+    existingStudent.device = record.device;
+  } else {
+    rosterData.unshift({
+      id: record.id.toUpperCase(),
+      name: record.name,
+      status: "present",
+      time: record.time,
+      device: record.device
+    });
+  }
+
+  updateMetrics();
+  renderRoster();
+}
+
 function updateTotalEnrolled() {
   const inputVal = parseInt(document.getElementById('input-total').value, 10);
   if (!isNaN(inputVal) && inputVal > 0) {
@@ -305,35 +303,9 @@ function toggleStudentStatus(studentId) {
       student.time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       student.device = 'Manual Check-in';
     }
-    saveRosterState();
     updateMetrics();
     renderRoster();
   }
-}
-
-// ==================== PROCESS STUDENT CHECK-IN ====================
-function processCheckInRecord(record) {
-  let existingStudent = rosterData.find(s => s.id.toLowerCase() === record.id.toLowerCase());
-
-  if (existingStudent) {
-    existingStudent.name = record.name; // Keep name synced
-    existingStudent.status = "present";
-    existingStudent.time = record.time;
-    existingStudent.device = record.device;
-  } else {
-    // Add new student to top of roster
-    rosterData.unshift({
-      id: record.id.toUpperCase(),
-      name: record.name,
-      status: "present",
-      time: record.time,
-      device: record.device
-    });
-  }
-
-  saveRosterState();
-  updateMetrics();
-  renderRoster();
 }
 
 // ==================== STUDENT SUBMISSION & EXPORT ====================
@@ -342,7 +314,6 @@ function handleStudentSubmit(e) {
   
   const studentId = document.getElementById('student-id').value.trim();
   const studentName = document.getElementById('student-name').value.trim();
-  const submittedToken = document.getElementById('session-token').value.trim();
 
   const successAlert = document.getElementById('checkin-success');
   const errorAlert = document.getElementById('checkin-error');
@@ -350,10 +321,7 @@ function handleStudentSubmit(e) {
   successAlert.style.display = "none";
   errorAlert.style.display = "none";
 
-  // Validate submitted token against valid token window
-  const isValid = validateToken(submittedToken);
-
-  if (!isValid || !isSessionActive) {
+  if (!isSessionActive) {
     errorAlert.style.display = "flex";
     return;
   }
@@ -366,19 +334,17 @@ function handleStudentSubmit(e) {
     device: "Mobile Web Check-in"
   };
 
-  // 1. Process check-in locally
+  // Process locally on student screen
   processCheckInRecord(checkInPayload);
 
-  // 2. Broadcast check-in to host tab/screen
-  if (attendanceChannel) {
-    attendanceChannel.postMessage({ type: "CHECK_IN", payload: checkInPayload });
+  // Send real-time check-in packet directly to host screen over WebRTC
+  if (window.scannedHostId) {
+    sendCheckInToHost(checkInPayload, window.scannedHostId);
   }
 
-  // 3. Show confirmation alert
   document.getElementById('success-timestamp').innerText = `Checked in at ${currentTime}`;
   successAlert.style.display = "flex";
 
-  // Reset input fields
   document.getElementById('student-id').value = "";
   document.getElementById('student-name').value = "";
 }
