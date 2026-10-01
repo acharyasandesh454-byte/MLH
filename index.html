@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attendance by QR Code</title>
+
+  <!-- Google Fonts & Lucide Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- QRCode.js Library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <!-- External Stylesheet -->
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="app.js">
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="logo">
+      <i data-lucide="qr-code"></i>
+      <span>AttendQR Live</span>
+    </div>
+    
+    <!-- View Switcher Tabs -->
+    <div class="view-toggle">
+      <button id="btn-host-view" class="toggle-btn active" onclick="switchView('host')">
+        <i data-lucide="presentation"></i> Host / Presenter View
+      </button>
+      <button id="btn-student-view" class="toggle-btn" onclick="switchView('student')">
+        <i data-lucide="smartphone"></i> Student Check-in View
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="container">
+
+    <!-- ==================== 1. HOST / INSTRUCTOR VIEW ==================== -->
+    <section id="host-view" class="view-panel active">
+      <div class="host-grid">
+        
+        <!-- Left Panel: Session QR Code Display -->
+        <div class="card qr-card">
+          <div class="card-header">
+            <h3><i data-lucide="qr-code"></i> Live Session QR Code</h3>
+            <span class="badge badge-success" id="qr-status-badge">Active</span>
+          </div>
+
+          <div class="qr-container">
+            <div id="qrcode"></div>
+            <div id="qr-loading" class="qr-placeholder" style="display:none;">
+              <i data-lucide="refresh-cw" class="spin"></i> Refreshing QR Code...
+            </div>
+          </div>
+
+          <!-- Dynamic Token Anti-Cheat Countdown -->
+          <div class="token-timer">
+            <div class="timer-text">
+              <span>Dynamic Refresh (Anti-Cheat):</span>
+              <strong id="timer-count">15s</strong>
+            </div>
+            <div class="progress-bar">
+              <div id="progress-fill" class="progress-fill"></div>
+            </div>
+          </div>
+
+          <p class="qr-instruction">
+            Scan with smartphone camera to check in.
+            <br>
+            <small>QR code auto-refreshes to prevent screenshot sharing.</small>
+          </p>
+
+          <div class="session-controls">
+            <button class="btn btn-outline" onclick="forceRefreshQR()">
+              <i data-lucide="rotate-cw"></i> Refresh Token Now
+            </button>
+            <button class="btn btn-secondary" id="btn-pause" onclick="toggleSessionState()">
+              <i data-lucide="pause-circle"></i> Pause Session
+            </button>
+          </div>
+        </div>
+
+        <!-- Right Panel: Attendance Metrics & Roster Table -->
+        <div class="card roster-card">
+          <div class="card-header border-bottom">
+            <div>
+              <h3><i data-lucide="users"></i> Live Attendance Roster</h3>
+              <p class="subtitle">CS-101: Computer Science Fundamentals — Today</p>
+            </div>
+            <button class="btn btn-primary" onclick="exportToCSV()">
+              <i data-lucide="download"></i> Export CSV
+            </button>
+          </div>
+
+          <!-- Summary Metric Cards with Editable Total Expected -->
+          <div class="metrics-row">
+            <div class="metric-card total-card">
+              <div class="metric-label">Total Expected</div>
+              <div class="total-input-wrapper">
+                <input type="number" id="input-total" min="1" value="25" class="metric-input" onchange="updateTotalEnrolled()" onkeyup="updateTotalEnrolled()">
+                <button class="btn-save-total" onclick="updateTotalEnrolled()" title="Update Total">
+                  <i data-lucide="check"></i>
+                </button>
+              </div>
+            </div>
+            <div class="metric-card present">
+              <div class="metric-value" id="count-present">18</div>
+              <div class="metric-label">Present</div>
+            </div>
+            <div class="metric-card absent">
+              <div class="metric-value" id="count-absent">7</div>
+              <div class="metric-label">Absent</div>
+            </div>
+            <div class="metric-card percentage">
+              <div class="metric-value" id="count-rate">72%</div>
+              <div class="metric-label">Attendance Rate</div>
+            </div>
+          </div>
+
+          <!-- Filters & Quick Actions -->
+          <div class="table-controls">
+            <div class="filter-tabs">
+              <button class="filter-btn active" onclick="filterRoster('all', this)">All</button>
+              <button class="filter-btn" onclick="filterRoster('present', this)">Present (<span id="filter-present-count">18</span>)</button>
+              <button class="filter-btn" onclick="filterRoster('absent', this)">Absent (<span id="filter-absent-count">7</span>)</button>
+            </div>
+            <div class="search-box">
+              <i data-lucide="search"></i>
+              <input type="text" id="search-input" placeholder="Search by name or ID..." onkeyup="handleSearch()">
+            </div>
+          </div>
+
+          <!-- Roster Table -->
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Student ID</th>
+                  <th>Name</th>
+                  <th>Check-In Time</th>
+                  <th>Device / Verification</th>
+                  <th>Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="roster-tbody">
+                <!-- Dynamic Roster Rows Injected via JS -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ==================== 2. STUDENT CHECK-IN VIEW ==================== -->
+    <section id="student-view" class="view-panel">
+      <div class="mobile-frame">
+        <div class="mobile-card">
+          <div class="mobile-header">
+            <div class="mobile-header-icon"><i data-lucide="user-check"></i></div>
+            <h2>Session Check-In</h2>
+            <p>CS-101: Computer Science Fundamentals</p>
+          </div>
+
+          <form id="checkin-form" onsubmit="handleStudentSubmit(event)">
+            <div class="form-group">
+              <label for="student-id">Student ID</label>
+              <input type="text" id="student-id" placeholder="e.g. STU-101" required>
+            </div>
+
+            <div class="form-group">
+              <label for="student-name">Full Name</label>
+              <input type="text" id="student-name" placeholder="e.g. Alex Morgan" required>
+            </div>
+
+            <div class="form-group">
+              <label for="session-token">Session Token</label>
+              <input type="text" id="session-token" class="token-input" readonly>
+              <small class="help-text">Auto-filled from scanned QR code URL token.</small>
+            </div>
+
+            <div class="geo-status">
+              <i data-lucide="map-pin"></i>
+              <span>Geofence Status: <strong>Classroom Wi-Fi Verified</strong></span>
+            </div>
+
+            <button type="submit" class="btn btn-primary btn-block">
+              <i data-lucide="check-circle"></i> Confirm Check-In
+            </button>
+          </form>
+
+          <!-- Success Alert Message -->
+          <div id="checkin-success" class="checkin-alert success" style="display: none;">
+            <i data-lucide="check-circle-2" class="alert-icon"></i>
+            <div>
+              <h4>Check-In Successful!</h4>
+              <p>Your attendance has been logged for today's session.</p>
+              <small id="success-timestamp"></small>
+            </div>
+          </div>
+
+          <!-- Error Alert Message -->
+          <div id="checkin-error" class="checkin-alert error" style="display: none;">
+            <i data-lucide="alert-triangle" class="alert-icon"></i>
+            <div>
+              <h4>Invalid or Expired Token</h4>
+              <p>Please scan the active QR code displayed on screen.</p>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- External JavaScript -->
+  <script src="app.js"></script>
+</body>
+</html>
