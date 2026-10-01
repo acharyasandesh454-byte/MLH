@@ -1,10 +1,16 @@
 // ==================== APP STATE & MOCK DATA ====================
 let currentToken = "";
+let validTokens = []; // Buffer array to keep tokens valid for 90s (prevents expiration while student fills form)
+const TOKEN_LIFESPAN_MS = 90000; // 90 seconds grace period
+
 let timerInterval = null;
 let currentTimerSeconds = 15;
 const REFRESH_INTERVAL = 15; // Seconds between QR code refreshes
 let isSessionActive = true;
-let customTotalCapacity = null; // Custom total capacity set by user
+let customTotalCapacity = null;
+
+// Setup Cross-Tab Communication Channel
+const attendanceChannel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("attend_qr_channel") : null;
 
 // Pre-populated Student Roster
 let rosterData = [
@@ -37,15 +43,48 @@ let rosterData = [
 
 let activeFilter = 'all';
 
-// ==================== INITIALIZATION & SCAN AUTO-DETECTION ====================
+// Load stored roster if returning to session
+if (localStorage.getItem('attendqr_roster')) {
+  try {
+    rosterData = JSON.parse(localStorage.getItem('attendqr_roster'));
+  } catch (e) {
+    console.error("Could not parse saved roster:", e);
+  }
+}
+
+// Save initial/updated roster state
+function saveRosterState() {
+  localStorage.setItem('attendqr_roster', JSON.stringify(rosterData));
+}
+
+// ==================== INITIALIZATION & LISTENERS ====================
 document.addEventListener("DOMContentLoaded", () => {
-  lucide.createIcons();
+  if (window.lucide) lucide.createIcons();
+  
   generateNewToken();
   startTokenTimer();
   renderRoster();
   updateMetrics();
 
-  // Check if page was loaded via scanned QR Code URL
+  // Listen for broadcasted student check-ins from other tabs
+  if (attendanceChannel) {
+    attendanceChannel.onmessage = (event) => {
+      if (event.data && event.data.type === "CHECK_IN") {
+        processCheckInRecord(event.data.payload);
+      }
+    };
+  }
+
+  // Fallback storage sync listener
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'attendqr_roster' && e.newValue) {
+      rosterData = JSON.parse(e.newValue);
+      renderRoster();
+      updateMetrics();
+    }
+  });
+
+  // Auto-detect view from scanned URL parameters
   const urlParams = new URLSearchParams(window.location.search);
   const scannedToken = urlParams.get('token');
   const viewMode = urlParams.get('view');
@@ -53,7 +92,8 @@ document.addEventListener("DOMContentLoaded", () => {
   if (viewMode === 'student' || scannedToken) {
     switchView('student');
     if (scannedToken) {
-      document.getElementById('session-token').value = scannedToken;
+      const tokenInput = document.getElementById('session-token');
+      if (tokenInput) tokenInput.value = scannedToken;
     }
   }
 });
@@ -70,7 +110,6 @@ function switchView(viewName) {
     document.getElementById('student-view').classList.add('active');
     document.getElementById('btn-student-view').classList.add('active');
     
-    // Sync current session token if not already filled
     const tokenInput = document.getElementById('session-token');
     if (tokenInput && !tokenInput.value) {
       tokenInput.value = currentToken;
@@ -78,21 +117,46 @@ function switchView(viewName) {
   }
 }
 
-// ==================== DYNAMIC QR CODE GENERATOR ====================
+// ==================== DYNAMIC QR & TOKEN MANAGEMENT ====================
 function generateNewToken() {
   currentToken = "TOK-" + Math.random().toString(36).substring(2, 9).toUpperCase();
+  
+  const now = Date.now();
+  validTokens.push({ token: currentToken, expiry: now + TOKEN_LIFESPAN_MS });
+  
+  // Clean up expired tokens older than 90 seconds
+  validTokens = validTokens.filter(t => t.expiry > now);
+
+  // Sync latest valid tokens across local storage
+  localStorage.setItem('attendqr_valid_tokens', JSON.stringify(validTokens));
+
   renderQRCode(currentToken);
   
-  // Sync token input if student check-in view is open
   const tokenInput = document.getElementById('session-token');
   if (tokenInput) tokenInput.value = currentToken;
 }
 
+function validateToken(tokenToTest) {
+  const now = Date.now();
+  let tokens = validTokens;
+
+  // Pull tokens from storage in case student is on another tab
+  const storedTokens = localStorage.getItem('attendqr_valid_tokens');
+  if (storedTokens) {
+    try {
+      tokens = JSON.parse(storedTokens);
+    } catch(e) {}
+  }
+
+  return tokens.some(t => t.token === tokenToTest && t.expiry > now);
+}
+
 function renderQRCode(token) {
   const qrContainer = document.getElementById("qrcode");
-  qrContainer.innerHTML = ""; // Clear existing QR code
+  if (!qrContainer) return;
+  
+  qrContainer.innerHTML = "";
 
-  // Generate URL pointing directly to student check-in page
   const baseURL = window.location.href.split('?')[0];
   const checkinURL = `${baseURL}?view=student&token=${token}`;
 
@@ -116,8 +180,11 @@ function startTokenTimer() {
     currentTimerSeconds--;
     const fillPercent = (currentTimerSeconds / REFRESH_INTERVAL) * 100;
     
-    document.getElementById('timer-count').innerText = `${currentTimerSeconds}s`;
-    document.getElementById('progress-fill').style.width = `${fillPercent}%`;
+    const timerElem = document.getElementById('timer-count');
+    const fillElem = document.getElementById('progress-fill');
+    
+    if (timerElem) timerElem.innerText = `${currentTimerSeconds}s`;
+    if (fillElem) fillElem.style.width = `${fillPercent}%`;
 
     if (currentTimerSeconds <= 0) {
       generateNewToken();
@@ -145,7 +212,7 @@ function toggleSessionState() {
     badge.innerText = "Paused";
     btn.innerHTML = `<i data-lucide="play-circle"></i> Resume Session`;
   }
-  lucide.createIcons();
+  if (window.lucide) lucide.createIcons();
 }
 
 // ==================== ROSTER & METRICS ====================
@@ -159,14 +226,11 @@ function updateTotalEnrolled() {
 
 function updateMetrics() {
   const scannedPresent = rosterData.filter(s => s.status === 'present').length;
-  
-  // Use manually entered total if provided, otherwise fallback to roster list size
   const total = customTotalCapacity !== null ? customTotalCapacity : rosterData.length;
   
-  // Update input field display
-  document.getElementById('input-total').value = total;
+  const totalInput = document.getElementById('input-total');
+  if (totalInput) totalInput.value = total;
 
-  // Calculate absent count and percentage
   const absent = Math.max(0, total - scannedPresent);
   const rate = total > 0 ? Math.round((scannedPresent / total) * 100) : 0;
 
@@ -180,7 +244,10 @@ function updateMetrics() {
 
 function renderRoster() {
   const tbody = document.getElementById('roster-tbody');
-  const searchQuery = document.getElementById('search-input').value.toLowerCase();
+  if (!tbody) return;
+
+  const searchInput = document.getElementById('search-input');
+  const searchQuery = searchInput ? searchInput.value.toLowerCase() : '';
   
   tbody.innerHTML = "";
 
@@ -238,12 +305,38 @@ function toggleStudentStatus(studentId) {
       student.time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       student.device = 'Manual Check-in';
     }
+    saveRosterState();
     updateMetrics();
     renderRoster();
   }
 }
 
-// ==================== STUDENT SUBMISSION & CSV EXPORT ====================
+// ==================== PROCESS STUDENT CHECK-IN ====================
+function processCheckInRecord(record) {
+  let existingStudent = rosterData.find(s => s.id.toLowerCase() === record.id.toLowerCase());
+
+  if (existingStudent) {
+    existingStudent.name = record.name; // Keep name synced
+    existingStudent.status = "present";
+    existingStudent.time = record.time;
+    existingStudent.device = record.device;
+  } else {
+    // Add new student to top of roster
+    rosterData.unshift({
+      id: record.id.toUpperCase(),
+      name: record.name,
+      status: "present",
+      time: record.time,
+      device: record.device
+    });
+  }
+
+  saveRosterState();
+  updateMetrics();
+  renderRoster();
+}
+
+// ==================== STUDENT SUBMISSION & EXPORT ====================
 function handleStudentSubmit(e) {
   e.preventDefault();
   
@@ -257,39 +350,35 @@ function handleStudentSubmit(e) {
   successAlert.style.display = "none";
   errorAlert.style.display = "none";
 
-  // Validate session token
-  if (submittedToken !== currentToken || !isSessionActive) {
+  // Validate submitted token against valid token window
+  const isValid = validateToken(submittedToken);
+
+  if (!isValid || !isSessionActive) {
     errorAlert.style.display = "flex";
     return;
   }
 
-  // Update or append student check-in
-  let existingStudent = rosterData.find(s => s.id.toLowerCase() === studentId.toLowerCase());
   const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const checkInPayload = {
+    id: studentId.toUpperCase(),
+    name: studentName,
+    time: currentTime,
+    device: "Mobile Web Check-in"
+  };
 
-  if (existingStudent) {
-    existingStudent.status = "present";
-    existingStudent.time = currentTime;
-    existingStudent.device = "Mobile Web Check-in";
-  } else {
-    rosterData.unshift({
-      id: studentId.toUpperCase(),
-      name: studentName,
-      status: "present",
-      time: currentTime,
-      device: "Mobile Web Check-in"
-    });
+  // 1. Process check-in locally
+  processCheckInRecord(checkInPayload);
+
+  // 2. Broadcast check-in to host tab/screen
+  if (attendanceChannel) {
+    attendanceChannel.postMessage({ type: "CHECK_IN", payload: checkInPayload });
   }
 
-  // Display success confirmation
+  // 3. Show confirmation alert
   document.getElementById('success-timestamp').innerText = `Checked in at ${currentTime}`;
   successAlert.style.display = "flex";
 
-  // Refresh dashboard metrics & table
-  updateMetrics();
-  renderRoster();
-
-  // Clear inputs
+  // Reset input fields
   document.getElementById('student-id').value = "";
   document.getElementById('student-name').value = "";
 }
